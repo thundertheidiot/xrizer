@@ -725,12 +725,14 @@ pub fn handle_sources(
                             return None;
                         };
 
-                        if validate_path(path).is_none() {
-                            InvalidActionPath(path, s).warn();
-                            return None;
+                        if let Some(path) = validate_path(path)
+                            .map(|path| context.instance.string_to_path(&path.to_string()).unwrap())
+                        {
+                            return Some(path);
                         }
 
-                        Some(context.instance.string_to_path(&path.to_string()).unwrap())
+                        InvalidActionPath(path, s).warn();
+                        None
                     },
                     path,
                     action_set_name,
@@ -769,7 +771,7 @@ pub fn handle_sources(
                 {
                     debug!(
                         "Falling back to pull for touch on {path} (action {:?})",
-                        &touch.output.path
+                        touch.output.path
                     );
                     // SteamVR fallbacks "touch" bindings on triggers to "any pull amount" if there's no native capsense
                     let with_pull = path.with_component(DynComponent::Value);
