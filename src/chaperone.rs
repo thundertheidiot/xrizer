@@ -1,5 +1,6 @@
 use crate::openxr_data::RealOpenXrData;
 use openvr as vr;
+use openxr as xr;
 use std::sync::Arc;
 
 #[derive(macros::InterfaceImpl)]
@@ -55,19 +56,56 @@ impl vr::IVRChaperone004_Interface for Chaperone {
         crate::warn_unimplemented!("ReloadInfo");
     }
     fn GetPlayAreaRect(&self, rect: *mut vr::HmdQuad_t) -> bool {
-        crate::warn_unimplemented!("GetPlayAreaRect");
+        let session_data = self.openxr.session_data.get();
+        let origin = match session_data.current_origin {
+            vr::ETrackingUniverseOrigin::Seated => xr::ReferenceSpaceType::LOCAL,
+            _ => xr::ReferenceSpaceType::STAGE,
+        };
+        let Ok(Some(bounds)) = session_data.session.reference_space_bounds_rect(origin) else {
+            unsafe {
+                *rect = Default::default();
+            }
+            return false;
+        };
+
+        let x = bounds.width / 2.0;
+        let z = bounds.height / 2.0;
         unsafe {
-            *rect = Default::default();
-        }
-        false
-    }
-    fn GetPlayAreaSize(&self, size_x: *mut f32, size_z: *mut f32) -> bool {
-        crate::warn_unimplemented!("GetPlayAreaSize");
-        unsafe {
-            *size_x = 1.0;
-            *size_z = 1.0;
+            rect.write(vr::HmdQuad_t {
+                vCorners: [
+                    vr::HmdVector3_t {
+                        v: [-x, 0.0, -z],
+                    },
+                    vr::HmdVector3_t { v: [-x, 0.0, z] },
+                    vr::HmdVector3_t { v: [x, 0.0, z] },
+                    vr::HmdVector3_t { v: [x, 0.0, -z] },
+                ],
+            })
         };
         true
+    }
+    fn GetPlayAreaSize(&self, size_x: *mut f32, size_z: *mut f32) -> bool {
+        let session_data = self.openxr.session_data.get();
+        let origin = match session_data.current_origin {
+            vr::ETrackingUniverseOrigin::Seated => xr::ReferenceSpaceType::LOCAL,
+            _ => xr::ReferenceSpaceType::STAGE,
+        };
+        match session_data.session.reference_space_bounds_rect(origin) {
+            Ok(Some(bounds)) => {
+                unsafe {
+                    *size_x = bounds.width;
+                    *size_z = bounds.height;
+                };
+                true
+            }
+            _ => {
+                unsafe {
+                    *size_x = 1.0;
+                    *size_z = 1.0;
+                };
+                false
+            }
+        }
     }
     fn GetCalibrationState(&self) -> vr::ChaperoneCalibrationState {
         vr::ChaperoneCalibrationState::OK

@@ -2,9 +2,10 @@ use crate::{
     clientcore::{Injected, Injector},
     compositor::{Compositor, is_usable_swapchain},
     graphics_backends::{GraphicsBackend, SupportedBackend, supported_apis_enum},
+    input::Input,
     openxr_data::{GraphicalSession, OpenXrData, Session, SessionData},
 };
-use glam::{Quat, Vec3, vec3};
+use glam::{Mat3, Quat, Vec3, vec3};
 use log::{debug, trace};
 use openvr as vr;
 use openxr as xr;
@@ -27,6 +28,7 @@ pub struct OverlayMan {
     openxr: Arc<OpenXrData<Compositor>>,
     /// should only be externally accessed for testing
     pub(crate) compositor: Injected<Compositor>,
+    input: Injected<Input<Compositor>>,
     overlays: RwLock<SlotMap<OverlayKey, Overlay>>,
     key_to_overlay: RwLock<HashMap<CString, OverlayKey>>,
     skybox: RwLock<Vec<OverlayKey>>,
@@ -41,6 +43,7 @@ impl OverlayMan {
             vtables: Vtables::default(),
             openxr,
             compositor: injector.inject(),
+            input: injector.inject(),
             overlays: Default::default(),
             key_to_overlay: Default::default(),
             skybox: Default::default(),
@@ -194,28 +197,54 @@ impl OverlayMan {
             };
 
             let SwapchainData { swapchain, .. } = swapchains.get(key).unwrap();
-            let space = session.get_space_for_origin(
-                overlay
-                    .transform
-                    .as_ref()
-                    .map(|(o, _)| *o)
-                    .unwrap_or(session.current_origin),
-            );
+
+            // Resolve the overlay transform. Device-relative transforms (usually
+            // pinned to the HMD) are composed with the live device pose in the
+            // current tracking space, so the overlay follows the device.
+            let (origin, mat) = if let Some((origin, t)) = overlay.transform {
+                (origin, t)
+            } else if let Some((device, rel)) = overlay.relative_transform {
+                let origin = session.current_origin;
+                let device_pose = self
+                    .input
+                    .force(|_| Input::new(self.openxr.clone()))
+                    .get_device_pose(device, Some(origin))
+                    .map(|p| p.mDeviceToAbsoluteTracking);
+                let mat = match device_pose {
+                    Some(device) => mat34_mul(&device, &rel),
+                    None => rel,
+                };
+                (origin, mat)
+            } else {
+                (
+                    session.current_origin,
+                    xr::Posef {
+                        position: xr::Vector3f {
+                            x: 0.0,
+                            y: 0.0,
+                            z: -0.5,
+                        },
+                        orientation: xr::Quaternionf::IDENTITY,
+                    }
+                    .into(),
+                )
+            };
+            let space = session.get_space_for_origin(origin);
 
             trace!("overlay rect: {rect:#?}");
 
-            let pose = overlay
-                .transform
-                .as_ref()
-                .map(|(_, t)| (*t).into())
-                .unwrap_or(xr::Posef {
-                    position: xr::Vector3f {
-                        x: 0.0,
-                        y: 0.0,
-                        z: -0.5,
-                    },
-                    orientation: xr::Quaternionf::IDENTITY,
-                });
+            let pose: xr::Posef = mat.into();
+            let o = pose.orientation;
+            let q = Quat::from_xyzw(o.x, o.y, o.z, o.w).normalize();
+            let pose = xr::Posef {
+                position: pose.position,
+                orientation: xr::Quaternionf {
+                    x: q.x,
+                    y: q.y,
+                    z: q.z,
+                    w: q.w,
+                },
+            };
 
             macro_rules! layer_init {
                 ($ty:ident) => {{
@@ -259,7 +288,7 @@ impl OverlayMan {
                         .pose(pose)
                         .size(xr::Extent2Df {
                             width: overlay.width,
-                            height: rect.extent.height as f32 * overlay.width
+                            height: rect.extent.height as f32 * overlay.texel_aspect * overlay.width
                                 / rect.extent.width as f32,
                         });
 
@@ -338,6 +367,34 @@ impl OverlayMan {
     ) -> Option<vr::VROverlayHandle_t> {
         // TODO: go through overlay handles and grab the next event.
         None
+    }
+}
+
+/// OpenVR HmdMatrix34_t is a row-major 3x4 affine transform (v' = M * v).
+/// Compose two of them: result = a ∘ b (apply b first, then a).
+fn mat34_mul(a: &vr::HmdMatrix34_t, b: &vr::HmdMatrix34_t) -> vr::HmdMatrix34_t {
+    let rot = |m: &vr::HmdMatrix34_t| {
+        // rows of the row-major matrix become glam columns
+        Mat3::from_cols(
+            vec3(m.m[0][0], m.m[1][0], m.m[2][0]),
+            vec3(m.m[0][1], m.m[1][1], m.m[2][1]),
+            vec3(m.m[0][2], m.m[1][2], m.m[2][2]),
+        )
+    };
+    let ra = rot(a);
+    let rb = rot(b);
+    let ta = vec3(a.m[0][3], a.m[1][3], a.m[2][3]);
+    let tb = vec3(b.m[0][3], b.m[1][3], b.m[2][3]);
+
+    let r = ra * rb;
+    let t = ra * tb + ta;
+
+    vr::HmdMatrix34_t {
+        m: [
+            [r.x_axis.x, r.y_axis.x, r.z_axis.x, t.x],
+            [r.x_axis.y, r.y_axis.y, r.z_axis.y, t.y],
+            [r.x_axis.z, r.y_axis.z, r.z_axis.z, t.z],
+        ],
     }
 }
 
@@ -476,6 +533,8 @@ struct Overlay {
     z_order: i64,
     bounds: vr::VRTextureBounds_t,
     transform: Option<(vr::ETrackingUniverseOrigin, vr::HmdMatrix34_t)>,
+    relative_transform: Option<(vr::TrackedDeviceIndex_t, vr::HmdMatrix34_t)>,
+    texel_aspect: f32,
     compositor: Option<SupportedBackend>,
     rect: Option<xr::Rect2Di>,
 }
@@ -497,6 +556,8 @@ impl Overlay {
                 vMax: 1.0,
             },
             transform: None,
+            relative_transform: None,
+            texel_aspect: 1.0,
             compositor: None,
             rect: None,
         }
@@ -1086,11 +1147,21 @@ impl vr::IVROverlay028_Interface for OverlayMan {
     }
     fn SetOverlayTransformTrackedDeviceRelative(
         &self,
-        _: vr::VROverlayHandle_t,
-        _: vr::TrackedDeviceIndex_t,
-        _: *const vr::HmdMatrix34_t,
+        handle: vr::VROverlayHandle_t,
+        tracked_device: vr::TrackedDeviceIndex_t,
+        transform: *const vr::HmdMatrix34_t,
     ) -> vr::EVROverlayError {
-        crate::warn_unimplemented!("SetOverlayTransformTrackedDeviceRelative");
+        get_overlay!(self, handle, mut overlay);
+        if transform.is_null() {
+            return vr::EVROverlayError::InvalidParameter;
+        }
+        let transform = unsafe { transform.read() };
+        debug!(
+            "set overlay transform relative to device {tracked_device} for {:?} ({transform:?})",
+            overlay.name
+        );
+        overlay.transform = None;
+        overlay.relative_transform = Some((tracked_device, transform));
         vr::EVROverlayError::None
     }
     fn GetOverlayTransformAbsolute(
@@ -1140,6 +1211,7 @@ impl vr::IVROverlay028_Interface for OverlayMan {
                 },
             };
             overlay.transform = Some((origin, transform.into()));
+            overlay.relative_transform = None;
             debug!(
                 "set overlay transform origin to {origin:?} for {:?} ({transform:?})",
                 overlay.name
@@ -1270,11 +1342,26 @@ impl vr::IVROverlay028_Interface for OverlayMan {
         overlay.z_order = value as _;
         vr::EVROverlayError::None
     }
-    fn GetOverlayTexelAspect(&self, _: vr::VROverlayHandle_t, _: *mut f32) -> vr::EVROverlayError {
-        todo!()
+    fn GetOverlayTexelAspect(
+        &self,
+        handle: vr::VROverlayHandle_t,
+        value: *mut f32,
+    ) -> vr::EVROverlayError {
+        get_overlay!(self, handle, overlay);
+        unsafe { *value = overlay.texel_aspect };
+        vr::EVROverlayError::None
     }
-    fn SetOverlayTexelAspect(&self, _: vr::VROverlayHandle_t, _: f32) -> vr::EVROverlayError {
-        crate::warn_unimplemented!("SetOverlayTexelAspect");
+    fn SetOverlayTexelAspect(
+        &self,
+        handle: vr::VROverlayHandle_t,
+        texel_aspect: f32,
+    ) -> vr::EVROverlayError {
+        get_overlay!(self, handle, mut overlay);
+        debug!(
+            "overlay {:?} texel aspect {} → {}",
+            overlay.name, overlay.texel_aspect, texel_aspect
+        );
+        overlay.texel_aspect = texel_aspect;
         vr::EVROverlayError::None
     }
     fn GetOverlayAlpha(
