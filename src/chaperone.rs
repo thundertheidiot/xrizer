@@ -1,6 +1,5 @@
 use crate::openxr_data::RealOpenXrData;
 use openvr as vr;
-use openxr as xr;
 use std::sync::Arc;
 
 #[derive(macros::InterfaceImpl)]
@@ -56,56 +55,20 @@ impl vr::IVRChaperone004_Interface for Chaperone {
         crate::warn_unimplemented!("ReloadInfo");
     }
     fn GetPlayAreaRect(&self, rect: *mut vr::HmdQuad_t) -> bool {
-        let session_data = self.openxr.session_data.get();
-        let origin = match session_data.current_origin {
-            vr::ETrackingUniverseOrigin::Seated => xr::ReferenceSpaceType::LOCAL,
-            _ => xr::ReferenceSpaceType::STAGE,
-        };
-        let Ok(Some(bounds)) = session_data.session.reference_space_bounds_rect(origin) else {
-            unsafe {
-                *rect = Default::default();
-            }
-            return false;
-        };
-
-        let x = bounds.width / 2.0;
-        let z = bounds.height / 2.0;
+        // Do NOT query xrGetReferenceSpaceBoundsRect here: monado's IPC protocol
+        // doesn't implement it and logs an ERROR (surfaced as a wayvr
+        // notification) on every call. Games handle "no play area" gracefully.
         unsafe {
-            rect.write(vr::HmdQuad_t {
-                vCorners: [
-                    vr::HmdVector3_t {
-                        v: [-x, 0.0, -z],
-                    },
-                    vr::HmdVector3_t { v: [-x, 0.0, z] },
-                    vr::HmdVector3_t { v: [x, 0.0, z] },
-                    vr::HmdVector3_t { v: [x, 0.0, -z] },
-                ],
-            })
-        };
-        true
+            *rect = Default::default();
+        }
+        false
     }
     fn GetPlayAreaSize(&self, size_x: *mut f32, size_z: *mut f32) -> bool {
-        let session_data = self.openxr.session_data.get();
-        let origin = match session_data.current_origin {
-            vr::ETrackingUniverseOrigin::Seated => xr::ReferenceSpaceType::LOCAL,
-            _ => xr::ReferenceSpaceType::STAGE,
+        unsafe {
+            *size_x = 1.0;
+            *size_z = 1.0;
         };
-        match session_data.session.reference_space_bounds_rect(origin) {
-            Ok(Some(bounds)) => {
-                unsafe {
-                    *size_x = bounds.width;
-                    *size_z = bounds.height;
-                };
-                true
-            }
-            _ => {
-                unsafe {
-                    *size_x = 1.0;
-                    *size_z = 1.0;
-                };
-                false
-            }
-        }
+        false
     }
     fn GetCalibrationState(&self) -> vr::ChaperoneCalibrationState {
         vr::ChaperoneCalibrationState::OK
