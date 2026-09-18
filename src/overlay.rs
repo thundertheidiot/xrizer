@@ -33,7 +33,7 @@ pub struct OverlayMan {
 }
 
 #[derive(derive_more::Deref)]
-struct RealSessionData<'a>(std::sync::RwLockReadGuard<'a, std::mem::ManuallyDrop<SessionData>>);
+struct RealSessionData<'a>(crate::openxr_data::SessionDataGuard<'a>);
 
 impl OverlayMan {
     pub fn new(openxr: Arc<OpenXrData<Compositor>>, injector: &Injector) -> Self {
