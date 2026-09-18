@@ -383,9 +383,41 @@ impl AtomicXrTime {
 }
 
 pub struct SessionReadGuard(RwLock<ManuallyDrop<SessionData>>);
+
+/// Number of `SessionDataGuard`s currently alive. Read guards can only be
+/// released by Drop, so if this counter climbs while a stall happens, some
+/// call path is leaking read guards (which permanently wedges the RwLock:
+/// a pending writer then blocks all new readers).
+pub static LIVE_SESSION_GUARDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub struct SessionDataGuard<'a>(std::sync::RwLockReadGuard<'a, ManuallyDrop<SessionData>>);
+
+impl Drop for SessionDataGuard<'_> {
+    fn drop(&mut self) {
+        LIVE_SESSION_GUARDS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for SessionDataGuard<'_> {
+    type Target = ManuallyDrop<SessionData>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl SessionReadGuard {
-    pub fn get(&self) -> std::sync::RwLockReadGuard<'_, ManuallyDrop<SessionData>> {
-        self.0.read().unwrap()
+    pub fn get(&self) -> SessionDataGuard<'_> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let live = LIVE_SESSION_GUARDS.fetch_add(1, Relaxed) + 1;
+        if live > 32 && log::log_enabled!(log::Level::Warn) {
+            // dump the acquire site: if guards are leaking, the culprit's
+            // stack shows up here repeatedly
+            let bt = std::backtrace::Backtrace::force_capture();
+            log::warn!("LIVE_SESSION_GUARDS={live} - possible read-guard leak, acquire backtrace:\n{bt}");
+        }
+        SessionDataGuard(self.0.read().unwrap())
     }
 }
 
